@@ -29,7 +29,7 @@
 
 #include <arpa/inet.h>
 #include <sys/time.h> 
-
+#include <signal.h> 
 #include <linux/tcp.h>
 
 #ifndef IPPROTO_MPTCP
@@ -42,11 +42,19 @@
 // port 
 #define TEST_PORT 15432
 #define BUFF_SIZE 256
+#define MICRO_SEC 1000000
 
 static void die_perror(const char *msg)
 {
 	perror(msg);
 	exit(1);
+}
+
+// catch interruptions 
+static volatile int keepRunning = 1;
+
+void intHandler(int dummy) {
+    keepRunning = 0;
 }
 
 /**
@@ -66,11 +74,14 @@ static long get_segment_delay(char* buffer, long receive_t)
 }
 
 
+
 /**
 *  server listen on port "15432"
+*  interval : in sec to write result , result if csv format : num seg, incoming time in micro , largest app delay on interval 
+*  out_file : name of file to write the results .. not implemented yeat 
 */
 
-static int server()
+static int server(double interval, bool verbose, const char* out_file)
 {
 	
 	struct sockaddr_in serv_addr, cli_addr;
@@ -78,16 +89,12 @@ static int server()
 	socklen_t clilen; 
 
 	// read buffer 
-	//const int BUFF_SIZE = 256;	// BUFFER SIZE
 	int n; 
 	char buffer[BUFF_SIZE];
 	
-	// Open file to write results, create if not exists 
-	// set next time to write
-	int results_fd = open("tmp-file.csv", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-	// FILE*  results_fd;
-	// results_fd = fopen("tmp-file.csv", "w");
-		
+	// interval file write on file  
+	long write_interval_tv = interval * MICRO_SEC;  // 10 mili 
+			
 	// create a MPTCP socket
     sockfd =  socket(AF_INET, SOCK_STREAM, IPPROTO_MPTCP);
     if (sockfd < 0) 
@@ -106,82 +113,79 @@ static int server()
     // convert short integer value for port must be converted into network byte order
     serv_addr.sin_port = htons(TEST_PORT);
 
-     // bind(int fd, struct sockaddr *local_addr, socklen_t addr_length)
-     // bind() passes file descriptor, the address structure, 
-     // and the length of the address structure
      // This bind() call will bind  the socket to the current IP address on port, portno
-     if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) 
+    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) 
             die_perror("ERROR on binding");
 
      // This listen() call tells the socket to listen to the incoming connections.
-     // The listen() function places all incoming connection into a backlog queue
-     // until accept() call accepts the connection.
-     // Here, we set the maximum size for the backlog queue to 5.
-     listen(sockfd,5);
+    listen(sockfd,5);
 
      // The accept() call actually accepts an incoming connection
-     clilen = sizeof(cli_addr);
+    clilen = sizeof(cli_addr);
+  
+	while (true){
+		 // The accept() returns a new socket file descriptor for the accepted connection.
+		newsockfd = accept(sockfd, (struct sockaddr *) &cli_addr, &clilen);
+		if (newsockfd < 0) 
+			  die_perror("ERROR on accept");
 
-     // The accept() returns a new socket file descriptor for the accepted connection.
-     // So, the original socket file descriptor can continue to be used 
-     // for accepting new connections while the new socker file descriptor is used for
-     // communicating with the connected client.
-    newsockfd = accept(sockfd, (struct sockaddr *) &cli_addr, &clilen);
-    if (newsockfd < 0) 
-          die_perror("ERROR on accept");
-
-    // This send() function sends the 13 bytes of the string to the new socket
-    // send(newsockfd, "Hello, world!\n", 13, 0);
-	// process_one_client 
-	
-
-    bzero(buffer,BUFF_SIZE);
-	long count_seg = 0;	// tottal received segments 
-	long max_delay = 0; // max delay on interval 
-    
-	struct timeval tv;
-	gettimeofday(&tv,NULL);
+		bzero(buffer,BUFF_SIZE);
+		long count_seg = 0;	// tottal received segments 
+		long max_delay = 0; // max delay on interval 
 		
-	long init_session_tv;	// tv mptcp session start's 
-	init_session_tv = tv.tv_sec * 1000000 + tv.tv_usec;
-	
-	// 100 ms interval file write 
-	long write_interval_tv = 10000L;
-	long next_write_tv = init_session_tv; 
-	
-	while ( (n = read(newsockfd,buffer,BUFF_SIZE) ) > 0 )  {
-		// printf("%ld Redded %d bytes \n", count_seg++, n);
-		// get server time when the segment was received  
 		struct timeval tv;
 		gettimeofday(&tv,NULL);
-		long receive_t = tv.tv_sec * 1000000 + tv.tv_usec;
+			
+		long init_session_tv;	// tv mptcp session start's 
+		init_session_tv = tv.tv_sec * MICRO_SEC + tv.tv_usec;
+	
+		long next_write_tv = init_session_tv; 
 		
-		// get segment app delay 
-		long seg_delay = get_segment_delay(buffer, receive_t);
-		if (seg_delay < 0 ) continue; 
-		
-		// get max delay on time interval  
-		max_delay = (seg_delay > max_delay)? seg_delay : max_delay; 
-		
-		// write to file if is time to do it 
-		if (receive_t > next_write_tv){
-			// set next time to write
-			next_write_tv = receive_t + write_interval_tv;  
-			bzero(buffer,BUFF_SIZE);
-			sprintf (buffer, "%ld , %ld , %ld \n",  count_seg++,  receive_t - init_session_tv, max_delay); 
-			printf ("%s", buffer);
-			write (results_fd, buffer, sizeof(buffer));
-			max_delay = 0; 			
+		int results_fd = 0; 
+		if (out_file){
+			// Open file to rewrite results, create if not exists 
+			results_fd = open(out_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 		}
-		//memset(&s, 0, sizeof(s));
+		
+		while ( (n = read(newsockfd,buffer,BUFF_SIZE) ) > 0 )  {
+			// printf("%ld Redded %d bytes \n", count_seg++, n);
+			// get server time when the segment was received  
+			struct timeval tv;
+			gettimeofday(&tv,NULL);
+			long receive_t = tv.tv_sec * MICRO_SEC + tv.tv_usec;
+			
+			// get segment app delay 
+			long seg_delay = get_segment_delay(buffer, receive_t);
+			if (seg_delay < 0 ) continue; 
+			
+			// get max delay on time interval  
+			max_delay = (seg_delay > max_delay)? seg_delay : max_delay; 
+			
+			// write to file if is time to do it 
+			if (receive_t > next_write_tv){
+				// set next time to write
+				next_write_tv = receive_t + write_interval_tv;  
+				bzero(buffer,BUFF_SIZE);
+				sprintf (buffer, "%ld , %ld , %ld \n",  count_seg++,  receive_t - init_session_tv, max_delay); 
+				
+				if (verbose) 
+					fprintf (stdout,"%s", buffer);
+				
+				if (results_fd)	
+					write (results_fd, buffer, sizeof(buffer));
+				
+				max_delay = 0; 			
+			}
+		}
+		if (n < 0) die_perror("ERROR reading from socket");
+		
+		fprintf (stdout,"Total samples received : %ld \n", count_seg); 
+		close(newsockfd);
+		if (results_fd) close (results_fd);
 	}
-    if (n < 0) 
-		die_perror("ERROR reading from socket");
-    
-    close(newsockfd);
+	
     close(sockfd);
-	close (results_fd); 
-	printf ("sever closed: Total samples writen to file : %ld \n", count_seg); 
+	 
 	return 0;
 }
 
@@ -213,6 +217,8 @@ static void gen_traffic (int sockfd, int gen_sec){
 		if (n < 0) 
 			die_perror("ERROR writing to socket");
 		seg_num ++ ; 
+		
+		//usleep(2500);		//sleeps for microsecond
 	}
 	
 	printf ("Total segments sended : %ld \n", seg_num); 
@@ -234,7 +240,7 @@ static int client(const char* remote_addr, int gen_time)
 	
 	
 	// This is to set Nagle buffering off
-	int yes = 0;
+	int yes = 1;
 	int result = setsockopt(sockfd,
                         SOL_SOCKET,	// IPPROTO_TCP , SOL_SOCKET is the socket layer itself. It is used for options that are protocol independent.
                         TCP_NODELAY,
@@ -253,8 +259,6 @@ static int client(const char* remote_addr, int gen_time)
     
 	if (connect(sockfd,(struct sockaddr *) &serv_addr,sizeof(serv_addr)) < 0) 
         die_perror("ERROR connecting");
-    
-	printf("Connected to %s \n", remote_addr);
 	
 	// generate traffic for N sec 
 	gen_traffic (sockfd, gen_time); 
@@ -267,21 +271,25 @@ static int client(const char* remote_addr, int gen_time)
 int main(int argc, char *argv[])
 {
 	
-	int c;
-	int gen_time = 1 ; // one sec by def 
-	bool is_client = false;
-    char* remote_addr =  NULL; 	
+	//signal(SIGINT, intHandler); // interuprion handler 
 	
+	int c;
+	int gen_time = 0 ; 				// no gen traffic by def 
+	bool is_client = false;
+    char* remote_addr =  NULL; 		// addr to connect to 
+	bool verbose = false; 			// print to console on server 
+	double interval = 0.1; 			// disolay/write interval 100 milisec
+	char* out_file = "tmp-file.csv"; // file to write results 
+		
 	// parsing arg : https://stackoverflow.com/questions/17877368/getopt-passing-string-parameter-for-argument
-	while ((c = getopt(argc, argv, "hsc:t:")) != -1) {
+	while ((c = getopt(argc, argv, "hsvc:t:i:")) != -1) {
 		
 		switch (c) {
 			case 'h':
 				//die_usage(0);
 				break;
 			case 's':
-				printf ("Server is runing \n"); 
-				server(); // server run 
+				is_client = false; 
 				break;
 			case 'c':
 				is_client = true;
@@ -289,6 +297,12 @@ int main(int argc, char *argv[])
 				break;
 			case 't':
 				gen_time = atoi(optarg); 
+				break;
+			case 'i':
+				interval = atof(optarg); 
+				break;
+			case 'v':
+				verbose = true;  
 				break;
 			default:
 				fprintf(stderr, "Usage: %s [-s or -c or -t] \n", argv[0]);
@@ -298,8 +312,16 @@ int main(int argc, char *argv[])
 	}
 	
 	if (is_client){
+		printf ("Client Mode:\n server addr : %s, gen_time %d sec\n ", remote_addr, gen_time); 
 		client(remote_addr,gen_time); 		// client run for N sec
-		if (remote_addr) free(remote_addr); 
-	} 
+	}
+	
+	else {
+		printf("Server Mode : inetrval %lf, verbose %d \n", interval, verbose);
+		server(interval,verbose, out_file); // server run 
+	}
+	
+	if (remote_addr) free(remote_addr); 
+	
 	return 0;
 }
